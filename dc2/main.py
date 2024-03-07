@@ -10,14 +10,22 @@ from utils.logger import get_logger
 from torch import optim
 from model.bert_classifier import BertClassifier
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from utils.load_data import *
 import argparse
+import random
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 def sep_data():
     data = list(load_data().keys())
     np.random.shuffle(data)
-    train_data = data[:int(len(data) * 0.9)]
-    val_data = data[int(len(data)*0.9):]
+    train_data = data[:int(len(data) * 0.75)]
+    val_data = data[int(len(data) * 0.75):]
     return train_data, val_data
 
 
@@ -28,6 +36,7 @@ def main():
                         help='input batch size for training (default: 128)')
     parser.add_argument('--epochs', type=int, default=5, metavar='N',
                         help='number of epochs to train (default: 5)')
+    parser.add_argument("--local-rank", type=int, default=-1)
     parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
                         help='learning rate (default: 1e-4)')
     parser.add_argument('--optim', type=str, default="Adam", metavar='OPT',
@@ -36,36 +45,51 @@ def main():
                         help='random seed (default: 3407)')
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
+    set_seed(args.seed)
     model = BertClassifier()
-    # device = torch.device("cuda")
-    device = torch.device("cuda")
+
+    torch.cuda.set_device(args.local_rank)
+    device = torch.device('cuda', args.local_rank)
+    
+    torch.distributed.init_process_group(backend='nccl')
+    
     model.to(device)
+    
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
     
     learning_rate = args.lr
     batch_size = args.batch_size
     epochs = args.epochs
-    model_name = "%s_e%d_b%d_lr%d_%s_token512" % ("bert", \
-        epochs, batch_size, learning_rate * 10000000, args.optim)
     
-    work_dir = os.path.join("./out", "bert", model_name)
-    if not os.path.exists(work_dir):
-        os.makedirs(work_dir)
-
-    train_log = os.path.join(work_dir, "train.log")
-    val_log = os.path.join(work_dir, "val.log")
-    with open(train_log, 'w') as _:
-        pass
-    with open(val_log, 'w') as _:
-        pass
-    train_logger = get_logger(train_log, name="train")
-    val_logger = get_logger(val_log, name="val")
-
+    if args.local_rank == 0:
+        # prepare logging
+        model_name = "%s_e%d_b%d_lr%d_%s_token128" % ("bert", \
+            epochs, batch_size, learning_rate * 10000000, args.optim)
+        
+        work_dir = os.path.join("./out", "bert", model_name)
+        if not os.path.exists(work_dir):
+            os.makedirs(work_dir)
+        train_log = os.path.join(work_dir, "train.log")
+        val_log = os.path.join(work_dir, "val.log")
+        with open(train_log, 'w') as _:
+            pass
+        with open(val_log, 'w') as _:
+            pass
+        train_logger = get_logger(train_log, name="train")
+        val_logger = get_logger(val_log, name="val")
+    
+    # prepare train dataset
+    
     train_data, val_data = sep_data()
     train_dataset = CustomDataset(train_data)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+    train_sampler = DistributedSampler(train_dataset)
+    train_loader = torch.utils.data.DataLoader(train_dataset, sampler=train_sampler, batch_size=batch_size, num_workers=8)
+    
+    # prepare val dataset
     val_dataset = CustomDataset(val_data)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+    # val_sampler = DistributedSampler(val_dataset)
+    val_loader = torch.utils.data.DataLoader(val_dataset, shuffle=True, batch_size=batch_size, num_workers=8)
+    
     if args.optim == "Adam":
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     elif args.optim == "SGD":
@@ -95,7 +119,8 @@ def main():
             batch_loss.backward()
             optimizer.step()
         scheduler.step()
-        train_logger.info(f'Training - Epoch {epoch + 1}, Batch: {batch_idx}/{len(train_loader)}, LR: {optimizer.param_groups[0]["lr"]}, Loss: {train_loss / len(train_data):.4f}, Acc: {train_acc / len(train_data):.4f}')
+        if args.local_rank == 0:
+            train_logger.info(f'Training - Epoch {epoch + 1}, LR: {optimizer.param_groups[0]["lr"]}, Loss: {4 * train_loss / len(train_data):.4f}, Acc: {4 * train_acc / len(train_data):.4f}')
         # validate
         if (epoch + 1) % 2 == 0:
             val_acc = 0
@@ -113,7 +138,11 @@ def main():
 
                     acc = (output.argmax(dim=1) == val_label).sum().item()
                     val_acc += acc
-            val_logger.info(f'Validating - Epoch {epoch + 1}, Loss: {val_loss/len(val_data):.4f}, Acc: {val_acc / len(val_data):.4f}')
+            if args.local_rank == 0:
+                val_logger.info(f'Validating - Epoch {epoch + 1}, Loss: {val_loss/len(val_data):.4f}, Acc: {val_acc / len(val_data):.4f}')
+
+    if args.local_rank not in [-1, 0]:
+        torch.distributed.barrier()
     #test
     test_label = load_test_labels()
     test_dataset = TestDataset(test_label)
@@ -134,5 +163,7 @@ def main():
     stars = [dic[ID] for ID in ids]
     df = pd.DataFrame({'ID': ids, 'stars': stars})
     df.to_csv('./out/%s/%s/%s.csv' % ("bert", model_name, model_name), index=False)
+    if args.local_rank == 0:
+        torch.distributed.barrier()
 if __name__ == '__main__':
     main()

@@ -17,7 +17,7 @@ class CustomDataset(Dataset):
         text = self.tokenizer(
                 self.texts[idx],
                 padding = "max_length",
-                max_length = 512,
+                max_length = 128,
                 truncation = True,
                 return_tensors = "pt"
             )
