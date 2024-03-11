@@ -15,10 +15,12 @@ from torch.utils.data.distributed import DistributedSampler
 from utils.load_data import *
 import argparse
 import random
+from scipy.special import softmax
+from huggingface_hub import login
 
 def set_seed(seed):
     random.seed(seed)
-    np.random.seed(seed)
+    # np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
@@ -33,8 +35,6 @@ def sep_data():
 def main():
     # parse args
     parser = argparse.ArgumentParser(description='stat940 data challenge 1')
-    parser.add_argument('--model', type=str, default="bert",
-                        help='model (default bert)')
     parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                         help='input batch size for training (default: 128)')
     parser.add_argument('--epochs', type=int, default=5, metavar='N',
@@ -49,12 +49,8 @@ def main():
     args = parser.parse_args()
 
     set_seed(args.seed)
-    if args.model == "bert":
-        model = BertClassifier()
-        tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
-    elif args.model == 'roberta':
-        tokenizer = AutoTokenizer.from_pretrained("cardiffnlp/twitter-roberta-base-sentiment")
-        model = AutoModelForSequenceClassification.from_pretrained("cardiffnlp/twitter-roberta-base-sentiment")
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", cache_dir="./")
+    model = AutoModelForSequenceClassification.from_pretrained("meta-llama/Llama-2-7b-hf", cache_dir="./" num_labels = 3)
 
     torch.cuda.set_device(args.local_rank)
     device = torch.device('cuda', args.local_rank)
@@ -71,10 +67,10 @@ def main():
     
     if args.local_rank == 0:
         # prepare logging
-        model_name = "%s_e%d_b%d_lr%d_%s_token128" % (args.model, \
+        model_name = "%s_e%d_b%d_lr%d_%s_token128" % ("llama", \
             epochs, batch_size, learning_rate * 10000000, args.optim)
         
-        work_dir = os.path.join("./out", "bert", model_name)
+        work_dir = os.path.join("./out", "llama", model_name)
         if not os.path.exists(work_dir):
             os.makedirs(work_dir)
         train_log = os.path.join(work_dir, "train.log")
@@ -106,6 +102,7 @@ def main():
         raise ValueError("No such optimizer: %s" % (args.optim))
     criterion = torch.nn.CrossEntropyLoss()
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs) 
+    sm = nn.Softmax(dim=1)
     # train&val
     for epoch in range(epochs):
         model.train()
@@ -118,7 +115,8 @@ def main():
             train_label = train_label.to(device)
             mask = train_input['attention_mask'].to(device)
             input_id = train_input['input_ids'].squeeze(1).to(device)
-            output = model(input_id, mask)
+            output = model(input_id, mask)[0]
+            res = torch.tensor(softmax(output.to(torch.device('cpu')).detach().numpy()))
             batch_loss = criterion(output, train_label)
             train_loss += batch_loss.item()
             acc = (output.argmax(dim=1) == train_label).sum().item()
@@ -139,8 +137,8 @@ def main():
                     val_label = val_label.to(device)
                     mask = val_input['attention_mask'].to(device)
                     input_id = val_input['input_ids'].squeeze(1).to(device)
-                    output = model(input_id, mask)
-
+                    output = model(input_id, mask).logits
+                    _, predict = output.max(1)
                     batch_loss = criterion(output, val_label)
                     val_loss += batch_loss.item()
 
@@ -149,29 +147,27 @@ def main():
             if args.local_rank == 0:
                 val_logger.info(f'Validating - Epoch {epoch + 1}, Loss: {val_loss/len(val_data):.4f}, Acc: {val_acc / len(val_data):.4f}')
 
-    if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()
-    #test
-    test_label = load_test_labels()
-    test_dataset = TestDataset(test_label)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
-    model.eval()
-    dic = {}
-    with torch.no_grad():
-        for ids, texts in test_loader:
-            texts = texts.to(device)
-            mask = texts['attention_mask'].to(device)
-            input_id = texts['input_ids'].squeeze(1).to(device)
-            outputs = model(input_id, mask)
-            _, predicted = outputs.max(1)
-            for idx in range(len(ids)):
-                dic[int(ids[idx])] = int(predicted[idx]) + 1
-    ids = list(dic.keys())
-    ids.sort()
-    stars = [dic[ID] for ID in ids]
-    df = pd.DataFrame({'ID': ids, 'stars': stars})
-    df.to_csv('./out/%s/%s/%s.csv' % (args.model, model_name, model_name), index=False)
     if args.local_rank == 0:
-        torch.distributed.barrier()
+        #test
+        test_label = load_test_labels()
+        test_dataset = TestDataset(test_label, tokenizer)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+        model.eval()
+        dic = {}
+        with torch.no_grad():
+            for ids, texts in test_loader:
+                texts = texts.to(device)
+                input_id = texts['input_ids'].squeeze(1)
+                attention_masks = texts['attention_mask']
+                outputs = model(input_id, attention_masks).logits
+                _, predicted = outputs.max(1)
+                predicted.to(torch.device('cpu'))
+                for idx in range(len(ids)):
+                    dic[int(ids[idx])] = int(predicted[idx]) + 1
+        ids = list(dic.keys())
+        ids.sort()
+        stars = [dic[ID] for ID in ids]
+        df = pd.DataFrame({'ID': ids, 'stars': stars})
+        df.to_csv('./out/%s/%s/%s.csv' % ("llama", model_name, model_name), index=False)
 if __name__ == '__main__':
     main()

@@ -5,9 +5,9 @@ import pandas as pd
 
 
 class CustomDataset(Dataset):
-    def __init__(self, data):
+    def __init__(self, data, tokenizer):
         self.label = load_data()
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+        self.tokenizer = tokenizer
         self.texts = data
 
     def __len__(self):
@@ -17,7 +17,7 @@ class CustomDataset(Dataset):
         text = self.tokenizer(
                 self.texts[idx],
                 padding = "max_length",
-                max_length = 128,
+                max_length = 512,
                 truncation = True,
                 return_tensors = "pt"
             )
@@ -26,9 +26,9 @@ class CustomDataset(Dataset):
 
 
 class TestDataset(Dataset):
-    def __init__(self, labels):
+    def __init__(self, labels, tokenizer):
         self.IDs = list(labels.keys())
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+        self.tokenizer = tokenizer
         self.texts = [
             self.tokenizer(
                 labels[ID],
