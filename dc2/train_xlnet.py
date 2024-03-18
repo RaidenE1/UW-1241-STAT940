@@ -104,12 +104,12 @@ def main():
     
     if args.optim == "Adam":
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    elif args.optim == "SGD":
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=5e-6)
+    # elif args.optim == "SGD":
+    #     optimizer = optim.SGD(model.parameters(), lr=learning_rate, weight_decay=5e-6)
     else:
         raise ValueError("No such optimizer: %s" % (args.optim))
     criterion = torch.nn.CrossEntropyLoss()
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs) 
+    scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=1, end_factor=0.1, total_iters=args.epochs)
     # train&val
     for epoch in range(epochs):
         model.train()
